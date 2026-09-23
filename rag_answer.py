@@ -3,20 +3,39 @@ Tiny RAG, stage 3: retrieve relevant chunks, then let an LLM write the answer.
 
 Needs:
   - rag_step1.py in the same folder (we reuse its document loading)
-  - Ollama running locally with a model pulled, e.g.:  ollama pull llama3.2
+  - A GGUF model file locally (e.g., download from Hugging Face)
+  - llama-cpp-python: pip install llama-cpp-python
 """
-import json
-import urllib.request
-
 import numpy as np
+from pathlib import Path
+import re
 from sentence_transformers import SentenceTransformer
+from llama_cpp import Llama
 
 # Reuse the settings and chunk loader we already wrote in stage 1.
 from rag_step1 import MODEL_NAME, TOP_K, load_chunks
 
-OLLAMA_URL = "http://localhost:11434/api/chat"  # Ollama's local address
-LLM_MODEL = "qwen3:8b"                         # the LLM that writes answers
+# Path to your local GGUF model file.
+# Download one from: https://huggingface.co/search?inference=true&model_type=text-generation&quantization=gguf
+MODEL_PATH = "./models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"  # adjust this path to your model
 MIN_SCORE = 0.3  # below this, treat a chunk as "not relevant enough"
+
+
+def missing_model_shards(model_path):
+    """Return missing files when model_path points at a split GGUF."""
+    path = Path(model_path)
+    match = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", path.name)
+    if not match:
+        return []
+
+    prefix, _, shard_count = match.groups()
+    return [
+        path.with_name(f"{prefix}-{number:05d}-of-{shard_count}.gguf")
+        for number in range(1, int(shard_count) + 1)
+        if not path.with_name(
+            f"{prefix}-{number:05d}-of-{shard_count}.gguf"
+        ).is_file()
+    ]
 
 
 def retrieve(question, model, chunks, doc_vectors):
@@ -33,27 +52,36 @@ def build_prompt(question, results):
         f"[Source: {chunk['source']}]\n{chunk['text']}" for chunk, _ in results
     )
     return (
-        "Answer the question using ONLY the documentation below.\n"
-        "If the documentation does not contain the answer, say "
-        "\"I couldn't find that in the documentation.\" Do not make things up.\n\n"
-        f"DOCUMENTATION:\n{context}\n\n"
-        f"QUESTION: {question}"
+        f"Documentation:\n{context}\n\n"
+        f"Question: {question}\n\n"
+        "Combine all documentation passages that are relevant to the question "
+        "into a clear, concise answer. Include distinct consequences and do not "
+        "merely copy the first matching passage."
     )
 
 
-def ask_llm(prompt):
+def ask_llm(prompt, llm):
     """The 'G' in RAG: send the prompt to the local LLM and return its answer."""
-    body = json.dumps({
-        "model": LLM_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,  # wait for the full answer instead of word-by-word
-        "think": False,   # Qwen3: skip the "thinking out loud" part, just answer
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        OLLAMA_URL, data=body, headers={"Content-Type": "application/json"}
+    response = llm.create_chat_completion(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Answer using only the supplied documentation. "
+                    "If it does not contain the answer, reply exactly: "
+                    "I couldn't find that in the documentation. "
+                    "Do not repeat the question, headings, or source labels. "
+                    "Synthesize all relevant facts; do not stop after the first one."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=256,
+        temperature=0.1,
+        top_p=0.95,
+        repeat_penalty=1.1,
     )
-    with urllib.request.urlopen(request, timeout=300) as response:
-        return json.loads(response.read())["message"]["content"]
+    return response["choices"][0]["message"]["content"].strip()
 
 
 def main():
@@ -62,6 +90,25 @@ def main():
     chunks = load_chunks()
     doc_vectors = model.encode([c["text"] for c in chunks], normalize_embeddings=True)
     print(f"Ready: {len(chunks)} chunks indexed.\n")
+
+    print(f"Loading LLM from {MODEL_PATH}...")
+    missing_shards = missing_model_shards(MODEL_PATH)
+    if missing_shards:
+        print("ERROR: This is a split GGUF model, and these shards are missing:")
+        for shard in missing_shards:
+            print(f"  - {shard}")
+        print("Download all shards into the same directory, then run this script again.")
+        return
+
+    try:
+        llm = Llama(model_path=MODEL_PATH, n_gpu_layers=-1, verbose=False)
+    except FileNotFoundError:
+        print(f"ERROR: Model file not found at {MODEL_PATH}")
+        print("Download a GGUF model from: https://huggingface.co/search?inference=true&model_type=text-generation&quantization=gguf")
+        print("Then update MODEL_PATH in this script.")
+        return
+    
+    print("Ready!\n")
 
     while True:
         question = input("Ask a question (or 'quit'): ").strip()
@@ -77,10 +124,9 @@ def main():
 
         print("\nThinking... (can take a while on CPU)")
         try:
-            answer = ask_llm(build_prompt(question, results))
+            answer = ask_llm(build_prompt(question, results), llm)
         except Exception as error:
-            print(f"Could not reach Ollama: {error}")
-            print(f"Is it running? Try: ollama run {LLM_MODEL}\n")
+            print(f"Error during LLM inference: {error}\n")
             continue
 
         print(f"\nANSWER:\n{answer}\n")
